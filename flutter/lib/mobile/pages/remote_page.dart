@@ -28,6 +28,13 @@ import '../widgets/custom_scale_widget.dart';
 
 final initText = '1' * 1024;
 
+/// Upper bound on how many backspaces a single soft-keyboard callback may
+/// forward to the host. A genuine IME edit removes one character (or a short
+/// composing run) per callback; anything larger means the buffer was rebuilt
+/// rather than edited, and replaying it as deletions would eat host text the
+/// user never deleted.
+const int _kMaxBackspacesPerCallback = 32;
+
 // Workaround for Android (default input method, Microsoft SwiftKey keyboard) when using physical keyboard.
 // When connecting a physical keyboard, `KeyEvent.physicalKey.usbHidUsage` are wrong is using Microsoft SwiftKey keyboard.
 // https://github.com/flutter/flutter/issues/159384
@@ -284,6 +291,9 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
       );
 
   void onSoftKeyboardChanged(bool visible) {
+    // Track soft-keyboard ownership so the input model can suppress synthetic
+    // KeyEvents while the IME owns the hidden editor.
+    inputModel.androidSoftKeyboardActive = visible;
     if (!visible) {
       SystemChrome.setEnabledSystemUIMode(SystemUiMode.manual, overlays: []);
       // [pi.version.isNotEmpty] -> check ready or not, avoid login without soft-keyboard
@@ -321,6 +331,16 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void _handleIOSSoftKeyboardInput(String newValue) {
+    // Same sentinel contract as the non-iOS path: the filler prefix must be
+    // intact for the trailing-character diff to mean anything. If the IME
+    // rewrote the whole buffer, diffing against the previous value walks into
+    // the filler and replays sentinel characters as input.
+    if (!newValue.startsWith(initText)) {
+      _value = newValue;
+      _openKeyboardUnlocked();
+      return;
+    }
+
     var oldValue = _value;
     _value = newValue;
     var i = newValue.length - 1;
@@ -358,8 +378,25 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
     }
 
     // Delete the different part in the old value.
-    for (i = 0; i < subOldValue.length - common; ++i) {
-      inputModel.inputKey('VK_BACK');
+    //
+    // This sends one VK_BACK per character the IME removed. Clamp it: an IME
+    // that collapses a composing word (or a held delete that Samsung
+    // accelerates) can report a large one-shot shrink, and forwarding that as
+    // a burst of backspaces deletes far more on the host than the user asked
+    // for. The host cannot undo what it never saw, so cap the burst and let
+    // the remaining deletions arrive on subsequent callbacks.
+    final deleteCount = subOldValue.length - common;
+    if (deleteCount > 0) {
+      if (deleteCount > _kMaxBackspacesPerCallback) {
+        // Too much was removed in one callback to be a real user edit.
+        // Resync instead of deleting blindly.
+        _value = newValue;
+        _openKeyboardUnlocked();
+        return;
+      }
+      for (i = 0; i < deleteCount; ++i) {
+        inputModel.inputKey('VK_BACK');
+      }
     }
 
     // Input the new string.
@@ -371,6 +408,25 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
   }
 
   void _handleNonIOSSoftKeyboardInput(String newValue) {
+    // The hidden editor is pre-filled with [initText] (1024 literal '1's) so
+    // that backspace always has a character to consume. Everything the IME
+    // inserts lands *after* that filler, therefore a well-behaved callback
+    // always starts with the filler prefix. If it does not, the IME has
+    // rewritten the buffer instead of appending to it (Samsung HoneyBoard does
+    // this on composing-range updates, word-suggestion acceptance, and on a
+    // delete that lands before the editor has settled). Diffing such a buffer
+    // against the previous one walks into the filler, so the sentinel character
+    // itself gets replayed as input - the "every key becomes 1" report.
+    //
+    // Treat a broken prefix as an IME reset: resync the baseline and do not
+    // forward anything for this callback. Losing one character is recoverable;
+    // unblocking the keyboard is not.
+    if (!newValue.startsWith(initText)) {
+      _value = newValue;
+      _openKeyboardUnlocked();
+      return;
+    }
+
     var oldValue = _value;
     _value = newValue;
     if (oldValue.isNotEmpty &&

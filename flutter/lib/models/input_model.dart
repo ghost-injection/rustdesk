@@ -490,6 +490,11 @@ class InputModel {
   // It should not block physical keyboard events.
   bool keyboardInputAllowed = true;
 
+  // True while the Android soft keyboard is driving the hidden editor. In this
+  // state KeyEvents carry synthesized (often wrong) physicalKey data, so
+  // handleKeyEvent must not forward them; text arrives via onChanged instead.
+  bool androidSoftKeyboardActive = false;
+
   bool get keyboardPerm => parent.target!.ffiModel.keyboard;
   String get id => parent.target?.id ?? '';
   String? get peerPlatform => parent.target?.ffiModel.pi.platform;
@@ -857,6 +862,29 @@ class InputModel {
       } else if (isWeb) {
         return KeyEventResult.ignored;
       }
+    }
+    // While the Android soft keyboard owns the hidden editor, the IME delivers
+    // KeyEvents whose physicalKey/usbHidUsage are synthesized and frequently
+    // wrong (flutter/flutter#157771). Feeding those through the legacy/map
+    // pipeline pushes a bogus key code to the host and leaves the client's
+    // modifier tracking out of sync - the corruption that makes every later
+    // keypress resolve to one character.
+    //
+    // Text already reaches the host through the editor's onChanged handler, so
+    // the correct move here is to consume the event without forwarding it.
+    // Backspace and Enter are the exception: some IMEs (ko/zh/ja) swallow them
+    // when the handler reports "handled", and they carry reliable logicalKey
+    // data, so forward those two explicitly.
+    if (isAndroid && androidSoftKeyboardActive) {
+      if (e is KeyDownEvent || e is KeyRepeatEvent) {
+        if (e.logicalKey == LogicalKeyboardKey.backspace) {
+          inputKey('VK_BACK', press: true);
+        } else if (e.logicalKey == LogicalKeyboardKey.enter ||
+            e.logicalKey == LogicalKeyboardKey.numpadEnter) {
+          inputKey('VK_RETURN', press: true);
+        }
+      }
+      return KeyEventResult.handled;
     }
     _syncFlutterShortcutModifiersAfterViewOnly(e.physicalKey);
     if (isWeb && _tryDispatchFlutterShortcut(e)) {
